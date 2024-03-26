@@ -6,6 +6,9 @@ import posixpath
 import shlex
 import signal
 import sys
+import psutil
+import enum
+import time
 from collections import namedtuple
 from dataclasses import asdict
 from datetime import datetime
@@ -69,6 +72,14 @@ MatchedProcessByPid = namedtuple('MatchedProcess', 'name pid')
 
 logger = logging.getLogger(__name__)
 
+class DataType(str, enum.Enum):
+    SCREENSHOT = "screenshot"
+    CPU = "cpu"
+    MEMORY = "memory"
+    NETWORK = "network"  # 流量
+    FPS = "fps"
+    PAGE = "page"
+    GPU = "gpu"
 
 @click.group()
 def cli():
@@ -177,7 +188,8 @@ def pkill(service_provider: LockdownServiceProvider, expression: str, bundle: Fa
         process_control = ProcessControl(dvt)
 
         for process in matching_processes:
-            logger.info(f'killing {process.name}({process.pid})')
+            logger.info(process.pid)
+            #logger.info(f'killing {process.name}({process.pid})')
             process_control.kill(process.pid)
 
 
@@ -258,9 +270,11 @@ def netstat(service_provider: LockdownClient):
         with NetworkMonitor(dvt) as monitor:
             for event in monitor:
                 if isinstance(event, ConnectionDetectionEvent):
-                    logger.info(
-                        f'Connection detected: {event.local_address.data.hostname}:{event.local_address.port} -> '
-                        f'{event.remote_address.data.hostname}:{event.remote_address.port}')
+                    logger.info("connection details -----",event)
+                   # logger.info(
+                    #    f'Connection detected: {event.local_address.data.hostname}:{event.local_address.port} -> '
+                    #    f'{event.remote_address.data.hostname}:{event.remote_address.port}')
+                    logger.info("Netstat")
 
 
 @dvt.command('screenshot', cls=Command)
@@ -312,6 +326,112 @@ def sysmon_process_monitor(service_provider: LockdownClient, threshold):
 
                 logger.info(entries)
 
+
+def sysmon_process_monitor(service_provider: LockdownClient, name):
+    """ monitor all most consuming processes by given cpuUsage threshold. """
+    logger.info("Triggering monitor v2 modification")
+    Process = namedtuple('process', 'ts pid name cpuUsage ResidentSize')
+    logger.info(Process)
+    
+    with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
+        device_info = DeviceInfo(dvt)
+        hardware = device_info.hardware_information()
+        cpu_count = hardware["numberOfCpus"]
+        logger.info(hardware["numberOfCpus"])
+        with Sysmontap(dvt) as sysmon:
+            for process_snapshot in sysmon.iter_processes():
+                entries = []
+                for process in process_snapshot:
+                    json_string = json.dumps(process) # Print JSON stringprint(json_string)
+                   # logger.log(json_string)
+                    process_name = process['pid']
+                    memory_size = process['memResidentSize']
+                    memory_size_KB = memory_size/1024
+                    process['memResidentSize'] = memory_size_KB
+                    #if (process['cpuUsage'] is not None) and (process['cpuUsage'] >= threshold):
+                    #if (process_name == name):
+                    if (process_name == name):
+                        if (process['cpuUsage'] is not None):
+                            cpu_Usage =  float (process['cpuUsage'])/ float (cpu_count)
+                            process['cpuUsage'] = cpu_Usage
+                            #logger.info(cpu_Usage)
+                        ts = time.time()
+                        entries.append(Process(ts = int(ts), pid=process['pid'], name=process['name'], cpuUsage=process['cpuUsage'], ResidentSize=process['memResidentSize']))
+                        json_string1 = json.dumps(entries)
+                        #logger.info(json_string1)
+                        print(json_string1)
+
+
+@sysmon_process.command('monitorv2', cls=Command)
+#@click.argument('threshold', type=click.FLOAT)
+@click.argument('arguments', type=click.STRING)
+#@click.argument('name', type=click.STRING)
+@click.option('--kill-existing/--no-kill-existing', default=True,
+              help='Whether to kill an existing instance of this process')
+@click.option('--suspended', is_flag=True, help='Same as WaitForDebugger')
+@click.option('--env', multiple=True, type=click.Tuple((str, str)),
+              help='Environment variables to pass to process given as a list of key value')
+@click.option('--stream', is_flag=True)
+def launch(service_provider: LockdownClient, arguments: str, kill_existing: bool, suspended: bool, env: tuple,
+           stream: bool) -> None:
+    """ Launch a process. """
+    with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
+        parsed_arguments = shlex.split(arguments)
+        process_control = ProcessControl(dvt)
+        pid = process_control.launch(bundle_id=parsed_arguments[0], arguments=parsed_arguments[1:],
+                                     kill_existing=kill_existing, start_suspended=suspended,
+                                     environment=dict(env))
+        #print(f'Process launched with pid {pid}')
+        #app_pid = pid
+        #logger.info(app_pid)
+        Process = namedtuple('process', 'ts pid name cpuUsage ResidentSize')
+        logger.info(Process)
+        sysmon_process_monitor(service_provider, pid)
+       
+        
+      
+def sysmon_process_monitor(service_provider: LockdownClient, name):
+    """ monitor all most consuming processes by given cpuUsage threshold. """
+    logger.info("Triggering monitor v2 modification")
+    Process = namedtuple('process', 'ts pid name cpuUsage ResidentSize') 
+    logger.info(Process)
+    
+    with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
+        device_info = DeviceInfo(dvt)
+        hardware = device_info.hardware_information()
+        cpu_count = hardware["numberOfCpus"]
+        logger.info(hardware["numberOfCpus"])
+        with Sysmontap(dvt) as sysmon:
+            for process_snapshot in sysmon.iter_processes():
+                entries = []
+                for process in process_snapshot:
+                    json_string = json.dumps(process) # Print JSON stringprint(json_string)
+                   # logger.log(json_string)
+                    process_name = process['pid']
+                    memory_size = process['memResidentSize']
+                    memory_size_KB = memory_size/1024
+                    process['memResidentSize'] = memory_size_KB
+                    #if (process['cpuUsage'] is not None) and (process['cpuUsage'] >= threshold):
+                    #if (process_name == name):
+                    if (process_name == name):
+                        if (process['cpuUsage'] is not None):
+                            cpu_Usage =  float (process['cpuUsage'])/ float (cpu_count)
+                            process['cpuUsage'] = cpu_Usage
+                            #logger.info(cpu_Usage)
+                        ts = time.time()
+                        entries.append(Process(ts = int(ts), pid=process['pid'], name=process['name'], cpuUsage=process['cpuUsage'], ResidentSize=process['memResidentSize']))
+                        cpuData = {"name":"cpu", "data":{"timestamp": int(ts),"pid": process['pid'],"value": process['cpuUsage'], "count": cpu_count}}
+                        memData = {"name":"memory", "data":{"timestamp": int(ts),"pid": process['pid'], "value":process['memResidentSize']}}
+                        networkData = {"name":"network", "data":{"timestamp": int(ts),"pid": process['pid']}}
+                        json_string = json.dumps(cpuData)
+                        logger.info(json_string)
+                        json_string1 = json.dumps(memData)
+                        logger.info(json_string1)
+                        json_string2 = json.dumps(networkData)
+                        logger.info(json_string2)
+                        #json_string1 = json.dumps(entries)
+                        #logger.info(json_string1)
+                        #print(json_string1)
 
 @sysmon_process.command('single', cls=Command)
 @click.option('-a', '--attributes', multiple=True,
