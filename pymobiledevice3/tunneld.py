@@ -28,7 +28,7 @@ from pymobiledevice3.utils import asyncio_print_traceback
 
 logger = logging.getLogger(__name__)
 
-TUNNELD_DEFAULT_ADDRESS = ('127.0.0.1', 49151)
+TUNNELD_DEFAULT_ADDRESS = ('127.0.0.1', 3300)
 
 # bugfix: after the device reboots, it might take some time for remoted to start answering the bonjour queries
 REATTEMPT_INTERVAL = 5
