@@ -6,6 +6,7 @@ import posixpath
 import shlex
 import signal
 import sys
+import psutil
 from collections import namedtuple
 from dataclasses import asdict
 from datetime import datetime
@@ -258,9 +259,11 @@ def netstat(service_provider: LockdownClient):
         with NetworkMonitor(dvt) as monitor:
             for event in monitor:
                 if isinstance(event, ConnectionDetectionEvent):
-                    logger.info(
-                        f'Connection detected: {event.local_address.data.hostname}:{event.local_address.port} -> '
-                        f'{event.remote_address.data.hostname}:{event.remote_address.port}')
+                    logger.info("connection details -----",event)
+                   # logger.info(
+                    #    f'Connection detected: {event.local_address.data.hostname}:{event.local_address.port} -> '
+                    #    f'{event.remote_address.data.hostname}:{event.remote_address.port}')
+                    logger.info("Netstat")
 
 
 @dvt.command('screenshot', cls=Command)
@@ -312,6 +315,37 @@ def sysmon_process_monitor(service_provider: LockdownClient, threshold):
 
                 logger.info(entries)
 
+
+@sysmon_process.command('monitorv2', cls=Command)
+#@click.argument('threshold', type=click.FLOAT)
+@click.argument('name', type=click.STRING)
+
+def sysmon_process_monitor(service_provider: LockdownClient, name):
+    """ monitor all most consuming processes by given cpuUsage threshold. """
+    logger.info("Triggering monitor v2 modification")
+    Process = namedtuple('process', 'pid name cpuUsage ResidentSize')
+    logger.info(Process)
+    with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
+        with Sysmontap(dvt) as sysmon:
+            for process_snapshot in sysmon.iter_processes():
+                entries = []
+                for process in process_snapshot:
+                    json_string = json.dumps(process) # Print JSON stringprint(json_string)
+                   # logger.log(json_string)
+                    process_name = process['name']
+                    memory_size = process['memResidentSize']
+                    memory_size_KB = memory_size/1024
+                    process['memResidentSize'] = memory_size_KB
+                    #app_cpu_usage = process['cpuUsage']
+                   # process['cpuUsage'] = psutil(app_cpu_usage)%
+                   # logger.info(process['cpuUsage'])
+                    
+                    #if (process['cpuUsage'] is not None) and (process['cpuUsage'] >= threshold):
+                    #if (process_name == name):
+                    if (process_name == name):
+                        #entries.append(Process(pid=process['pid'], name=process['name'], cpuUsage=process['cpuUsage'], ResidentSize=process['memResidentSize']))
+                        json_string1 = json.dumps(process)
+                        logger.info(json_string1)
 
 @sysmon_process.command('single', cls=Command)
 @click.option('-a', '--attributes', multiple=True,
