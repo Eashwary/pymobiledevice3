@@ -1,17 +1,19 @@
 # flake8: noqa: C901
+import asyncio
 import json
 import logging
 import os
 import posixpath
 import shlex
+import enum
+import time
 import signal
 import sys
-import psutil
 from collections import namedtuple
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import click
 from click.exceptions import MissingParameter, UsageError
@@ -20,11 +22,12 @@ from pykdebugparser.pykdebugparser import PyKdebugParser
 
 import pymobiledevice3
 from pymobiledevice3.cli.cli_common import BASED_INT, Command, RSDCommand, default_json_encoder, print_json, \
-    user_requested_colored_output, wait_return
-from pymobiledevice3.exceptions import DeviceAlreadyInUseError, DvtDirListError, ExtractingStackshotError, \
-    RSDRequiredError, UnrecognizedSelectorError
+    user_requested_colored_output
+from pymobiledevice3.exceptions import ArgumentError, DeviceAlreadyInUseError, DvtDirListError, \
+    ExtractingStackshotError, RSDRequiredError, UnrecognizedSelectorError
 from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
+from pymobiledevice3.osu.os_utils import get_os_utils
 from pymobiledevice3.remote.core_device.app_service import AppServiceService
 from pymobiledevice3.remote.core_device.device_info import DeviceInfoService
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
@@ -53,6 +56,7 @@ from pymobiledevice3.services.screenshot import ScreenshotService
 from pymobiledevice3.services.simulate_location import DtSimulateLocation
 from pymobiledevice3.tcp_forwarder import LockdownTcpForwarder
 
+OSUTILS = get_os_utils()
 BSC_SUBCLASS = 0x40c
 BSC_CLASS = 0x4
 VFS_AND_TRACES_SET = {0x03010000, 0x07ff0000}
@@ -70,6 +74,14 @@ MatchedProcessByPid = namedtuple('MatchedProcess', 'name pid')
 
 logger = logging.getLogger(__name__)
 
+class DataType(str, enum.Enum):
+    SCREENSHOT = "screenshot"
+    CPU = "cpu"
+    MEMORY = "memory"
+    NETWORK = "network"  # 流量
+    FPS = "fps"
+    PAGE = "page"
+    GPU = "gpu"
 
 @click.group()
 def cli():
@@ -86,6 +98,10 @@ def developer():
     to execution. You can achieve this using:
 
     pymobiledevice3 mounter mount
+
+    Also, starting at iOS 17.0, a tunnel must be created to the device for the services
+    to be accessible. Therefore, every CLI command is retried with a `--tunnel` option
+    for implicitly accessing tunneld when necessary
     """
     pass
 
@@ -118,7 +134,7 @@ def proclist(service_provider: LockdownClient):
 
 
 @dvt.command('applist', cls=Command)
-def applist(service_provider: LockdownClient, color):
+def applist(service_provider: LockdownServiceProvider) -> None:
     """ show application list """
     with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
         apps = ApplicationListing(dvt).applist()
@@ -259,11 +275,9 @@ def netstat(service_provider: LockdownClient):
         with NetworkMonitor(dvt) as monitor:
             for event in monitor:
                 if isinstance(event, ConnectionDetectionEvent):
-                    logger.info("connection details -----",event)
-                   # logger.info(
-                    #    f'Connection detected: {event.local_address.data.hostname}:{event.local_address.port} -> '
-                    #    f'{event.remote_address.data.hostname}:{event.remote_address.port}')
-                    logger.info("Netstat")
+                    logger.info(
+                        f'Connection detected: {event.local_address.data.address}:{event.local_address.port} -> '
+                        f'{event.remote_address.data.address}:{event.remote_address.port}')
 
 
 @dvt.command('screenshot', cls=Command)
@@ -318,34 +332,72 @@ def sysmon_process_monitor(service_provider: LockdownClient, threshold):
 
 @sysmon_process.command('monitorv2', cls=Command)
 #@click.argument('threshold', type=click.FLOAT)
-@click.argument('name', type=click.STRING)
-
+@click.argument('arguments', type=click.STRING)
+#@click.argument('name', type=click.STRING)
+@click.option('--kill-existing/--no-kill-existing', default=True,
+              help='Whether to kill an existing instance of this process')
+@click.option('--suspended', is_flag=True, help='Same as WaitForDebugger')
+@click.option('--env', multiple=True, type=click.Tuple((str, str)),
+              help='Environment variables to pass to process given as a list of key value')
+@click.option('--stream', is_flag=True)
+def launch(service_provider: LockdownClient, arguments: str, kill_existing: bool, suspended: bool, env: tuple,
+           stream: bool) -> None:
+    """ Launch a process. """
+    with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
+        parsed_arguments = shlex.split(arguments)
+        process_control = ProcessControl(dvt)
+        pid = process_control.launch(bundle_id=parsed_arguments[0], arguments=parsed_arguments[1:],
+                                     kill_existing=kill_existing, start_suspended=suspended,
+                                     environment=dict(env))
+        #print(f'Process launched with pid {pid}')
+        #app_pid = pid
+        #logger.info(app_pid)
+        Process = namedtuple('process', 'ts pid name cpuUsage ResidentSize')
+        logger.info(Process)
+        sysmon_process_monitor(service_provider, pid)
+    
 def sysmon_process_monitor(service_provider: LockdownClient, name):
     """ monitor all most consuming processes by given cpuUsage threshold. """
     logger.info("Triggering monitor v2 modification")
-    Process = namedtuple('process', 'pid name cpuUsage ResidentSize')
+    Process = namedtuple('process', 'ts pid name cpuUsage ResidentSize') 
     logger.info(Process)
+    
     with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
+        device_info = DeviceInfo(dvt)
+        hardware = device_info.hardware_information()
+        cpu_count = hardware["numberOfCpus"]
+        logger.info(hardware["numberOfCpus"])
         with Sysmontap(dvt) as sysmon:
             for process_snapshot in sysmon.iter_processes():
                 entries = []
                 for process in process_snapshot:
                     json_string = json.dumps(process) # Print JSON stringprint(json_string)
                    # logger.log(json_string)
-                    process_name = process['name']
+                    process_name = process['pid']
                     memory_size = process['memResidentSize']
                     memory_size_KB = memory_size/1024
                     process['memResidentSize'] = memory_size_KB
-                    #app_cpu_usage = process['cpuUsage']
-                   # process['cpuUsage'] = psutil(app_cpu_usage)%
-                   # logger.info(process['cpuUsage'])
-                    
                     #if (process['cpuUsage'] is not None) and (process['cpuUsage'] >= threshold):
                     #if (process_name == name):
                     if (process_name == name):
-                        #entries.append(Process(pid=process['pid'], name=process['name'], cpuUsage=process['cpuUsage'], ResidentSize=process['memResidentSize']))
-                        json_string1 = json.dumps(process)
+                        if (process['cpuUsage'] is not None):
+                            cpu_Usage =  float (process['cpuUsage'])/ float (cpu_count)
+                            process['cpuUsage'] = cpu_Usage
+                            #logger.info(cpu_Usage)
+                        ts = time.time()
+                        entries.append(Process(ts = int(ts), pid=process['pid'], name=process['name'], cpuUsage=process['cpuUsage'], ResidentSize=process['memResidentSize']))
+                        cpuData = {"name":"cpu", "data":{"timestamp": int(ts),"pid": process['pid'],"value": process['cpuUsage'], "count": cpu_count}}
+                        memData = {"name":"memory", "data":{"timestamp": int(ts),"pid": process['pid'], "value":process['memResidentSize']}}
+                        networkData = {"name":"network", "data":{"timestamp": int(ts),"pid": process['pid']}}
+                        json_string = json.dumps(cpuData)
+                        logger.info(json_string)
+                        json_string1 = json.dumps(memData)
                         logger.info(json_string1)
+                        json_string2 = json.dumps(networkData)
+                        logger.info(json_string2)
+                        #json_string1 = json.dumps(entries)
+                        #logger.info(json_string1)
+                        #print(json_string1)
 
 @sysmon_process.command('single', cls=Command)
 @click.option('-a', '--attributes', multiple=True,
@@ -715,20 +767,26 @@ def fetch_symbols():
     pass
 
 
-@fetch_symbols.command('list', cls=Command)
-def fetch_symbols_list(service_provider: LockdownServiceProvider):
-    """ list of files to be downloaded """
+async def fetch_symbols_list_task(service_provider: LockdownServiceProvider) -> None:
     if Version(service_provider.product_version) < Version('17.0'):
         print_json(DtFetchSymbols(service_provider).list_files())
     else:
-        with RemoteFetchSymbolsService(service_provider) as fetch_symbols:
-            print_json([f.file_path for f in fetch_symbols.get_dsc_file_list()])
+        if not isinstance(service_provider, RemoteServiceDiscoveryService):
+            raise ArgumentError('service_provider must be a RemoteServiceDiscoveryService for iOS 17+ devices')
+
+        async with RemoteFetchSymbolsService(service_provider) as fetch_symbols:
+            print_json([f.file_path for f in await fetch_symbols.get_dsc_file_list()])
 
 
-@fetch_symbols.command('download', cls=Command)
-@click.argument('out', type=click.Path(dir_okay=True, file_okay=False))
-def fetch_symbols_download(service_provider: LockdownServiceProvider, out):
-    """ download the linker and dyld cache to a specified directory """
+@fetch_symbols.command('list', cls=Command)
+def fetch_symbols_list(service_provider: LockdownServiceProvider) -> None:
+    """ list of files to be downloaded """
+    asyncio.run(fetch_symbols_list_task(service_provider), debug=True)
+
+
+async def fetch_symbols_download_task(service_provider: LockdownServiceProvider, out: str) -> None:
+    if not isinstance(service_provider, RemoteServiceDiscoveryService):
+        raise ArgumentError('service_provider must be a RemoteServiceDiscoveryService for iOS 17+ devices')
 
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -756,8 +814,15 @@ def fetch_symbols_download(service_provider: LockdownServiceProvider, out):
                 logger.info(f'writing to: {file}')
                 fetch_symbols.get_file(i, f)
     else:
-        with RemoteFetchSymbolsService(service_provider) as fetch_symbols:
-            fetch_symbols.download(out)
+        async with RemoteFetchSymbolsService(service_provider) as fetch_symbols:
+            await fetch_symbols.download(out)
+
+
+@fetch_symbols.command('download', cls=Command)
+@click.argument('out', type=click.Path(dir_okay=True, file_okay=False))
+def fetch_symbols_download(service_provider: LockdownServiceProvider, out: str) -> None:
+    """ download the linker and dyld cache to a specified directory """
+    asyncio.run(fetch_symbols_download_task(service_provider, out), debug=True)
 
 
 @developer.group('simulate-location')
@@ -786,10 +851,11 @@ def simulate_location_set(service_provider: LockdownClient, latitude, longitude)
 
 @simulate_location.command('play', cls=Command)
 @click.argument('filename', type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument('timing_randomness_range', type=click.INT)
 @click.option('--disable-sleep', is_flag=True, default=False)
-def simulate_location_play(service_provider: LockdownClient, filename, disable_sleep):
+def simulate_location_play(service_provider: LockdownClient, filename, timing_randomness_range, disable_sleep):
     """ play a .gpx file """
-    DtSimulateLocation(service_provider).play_gpx_file(filename, disable_sleep=disable_sleep)
+    DtSimulateLocation(service_provider).play_gpx_file(filename, timing_randomness_range, disable_sleep=disable_sleep)
 
 
 @developer.group('accessibility')
@@ -843,7 +909,7 @@ def accessibility_settings_set(service_provider: LockdownClient, setting, value)
     """
     service = AccessibilityAudit(service_provider)
     service.set_setting(setting, eval(value))
-    wait_return()
+    OSUTILS.wait_return()
 
 
 @accessibility.command('shell', cls=Command)
@@ -920,7 +986,7 @@ def condition_set(service_provider: LockdownClient, profile_identifier):
     """ set a specific condition """
     with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
         ConditionInducer(dvt).set(profile_identifier)
-        wait_return()
+        OSUTILS.wait_return()
 
 
 @developer.command(cls=Command)
@@ -965,7 +1031,7 @@ def debugserver_start_server(service_provider: LockdownClient, local_port: Optio
         LockdownTcpForwarder(service_provider, local_port, service_name).start()
     elif Version(service_provider.product_version) >= Version('17.0'):
         if not isinstance(service_provider, RemoteServiceDiscoveryService):
-            raise RSDRequiredError()
+            raise RSDRequiredError(service_provider.identifier)
         debugserver_port = service_provider.get_service_port(service_name)
         print(DEBUGSERVER_CONNECTION_STEPS.format(host=service_provider.service.address[0], port=debugserver_port))
     else:
@@ -993,7 +1059,7 @@ def check_in(service_provider: LockdownClient, hostname, force):
     with DtDeviceArbitration(service_provider) as device_arbitration:
         try:
             device_arbitration.check_in(hostname, force=force)
-            wait_return()
+            OSUTILS.wait_return()
         except DeviceAlreadyInUseError as e:
             logger.error(e.message)
 
@@ -1039,80 +1105,143 @@ def dvt_simulate_location_set(service_provider: LockdownClient, latitude, longit
     """
     with DvtSecureSocketProxyService(service_provider) as dvt:
         LocationSimulation(dvt).set(latitude, longitude)
-        wait_return()
+        OSUTILS.wait_return()
 
 
 @dvt_simulate_location.command('play', cls=Command)
 @click.argument('filename', type=click.Path(exists=True, file_okay=True, dir_okay=False))
+@click.argument('timing_randomness_range', type=click.INT, default=0)
 @click.option('--disable-sleep', is_flag=True, default=False)
-def dvt_simulate_location_play(service_provider: LockdownClient, filename: str, disable_sleep: bool) -> None:
+def dvt_simulate_location_play(service_provider: LockdownClient, filename: str, timing_randomness_range: int,
+                               disable_sleep: bool) -> None:
     """ play a .gpx file """
     with DvtSecureSocketProxyService(service_provider) as dvt:
-        LocationSimulation(dvt).play_gpx_file(filename, disable_sleep=disable_sleep)
-        wait_return()
+        LocationSimulation(dvt).play_gpx_file(filename, disable_sleep=disable_sleep,
+                                              timing_randomness_range=timing_randomness_range)
+        OSUTILS.wait_return()
 
 
 @developer.group()
-def core_device():
+def core_device() -> None:
     """ core-device options """
     pass
 
 
+async def core_device_list_launch_application_task(
+        service_provider: RemoteServiceDiscoveryService, bundle_identifier: str, argument: List[str],
+        kill_existing: bool, suspended: bool, env: List[Tuple[str, str]]) -> None:
+    async with AppServiceService(service_provider) as app_service:
+        print_json(await app_service.launch_application(bundle_identifier, argument, kill_existing,
+                                                        suspended, dict(env)))
+
+
+@core_device.command('launch-application', cls=RSDCommand)
+@click.argument('bundle_identifier')
+@click.argument('argument', nargs=-1)
+@click.option('--kill-existing/--no-kill-existing', default=True,
+              help='Whether to kill an existing instance of this process')
+@click.option('--suspended', is_flag=True, help='Same as WaitForDebugger')
+@click.option('--env', multiple=True, type=click.Tuple((str, str)),
+              help='Environment variables to pass to process given as a list of key value')
+def core_device_launch_application(
+        service_provider: RemoteServiceDiscoveryService, bundle_identifier: str, argument: Tuple[str],
+        kill_existing: bool, suspended: bool, env: List[Tuple[str, str]]) -> None:
+    """ Launch application """
+    asyncio.run(
+        core_device_list_launch_application_task(
+            service_provider, bundle_identifier, list(argument), kill_existing, suspended, env))
+
+
+async def core_device_list_processes_task(service_provider: RemoteServiceDiscoveryService) -> None:
+    async with AppServiceService(service_provider) as app_service:
+        print_json(await app_service.list_processes())
+
+
 @core_device.command('list-processes', cls=RSDCommand)
-def core_device_list_processes(service_provider: RemoteServiceDiscoveryService):
+def core_device_list_processes(service_provider: RemoteServiceDiscoveryService) -> None:
     """ Get process list """
-    with AppServiceService(service_provider) as app_service:
-        print_json(app_service.list_processes())
+    asyncio.run(core_device_list_processes_task(service_provider))
+
+
+async def core_device_uninstall_app_task(service_provider: RemoteServiceDiscoveryService,
+                                         bundle_identifier: str) -> None:
+    async with AppServiceService(service_provider) as app_service:
+        await app_service.uninstall_app(bundle_identifier)
 
 
 @core_device.command('uninstall', cls=RSDCommand)
 @click.argument('bundle_identifier')
-def core_device_uninstall_app(service_provider: RemoteServiceDiscoveryService, bundle_identifier: str):
+def core_device_uninstall_app(service_provider: RemoteServiceDiscoveryService, bundle_identifier: str) -> None:
     """ Uninstall application """
-    with AppServiceService(service_provider) as app_service:
-        app_service.uninstall_app(bundle_identifier)
+    asyncio.run(core_device_uninstall_app_task(service_provider, bundle_identifier))
+
+
+async def core_device_send_signal_to_process_task(
+        service_provider: RemoteServiceDiscoveryService, pid: int, signal: int) -> None:
+    async with AppServiceService(service_provider) as app_service:
+        print_json(await app_service.send_signal_to_process(pid, signal))
 
 
 @core_device.command('send-signal-to-process', cls=RSDCommand)
 @click.argument('pid', type=click.INT)
 @click.argument('signal', type=click.INT)
-def core_device_send_signal_to_process(service_provider: RemoteServiceDiscoveryService, pid: int, signal: int):
+def core_device_send_signal_to_process(service_provider: RemoteServiceDiscoveryService, pid: int, signal: int) -> None:
     """ Send signal to process """
-    with AppServiceService(service_provider) as app_service:
-        print_json(app_service.send_signal_to_process(pid, signal))
+    asyncio.run(core_device_send_signal_to_process_task(service_provider, pid, signal))
+
+
+async def core_device_get_device_info_task(service_provider: RemoteServiceDiscoveryService) -> None:
+    async with DeviceInfoService(service_provider) as app_service:
+        print_json(await app_service.get_device_info())
 
 
 @core_device.command('get-device-info', cls=RSDCommand)
-def core_device_get_device_info(service_provider: RemoteServiceDiscoveryService):
+def core_device_get_device_info(service_provider: RemoteServiceDiscoveryService) -> None:
     """ Get device information """
-    with DeviceInfoService(service_provider) as app_service:
-        print_json(app_service.get_device_info())
+    asyncio.run(core_device_get_device_info_task(service_provider))
+
+
+async def core_device_get_display_info_task(service_provider: RemoteServiceDiscoveryService) -> None:
+    async with DeviceInfoService(service_provider) as app_service:
+        print_json(await app_service.get_display_info())
 
 
 @core_device.command('get-display-info', cls=RSDCommand)
-def core_device_get_display_info(service_provider: RemoteServiceDiscoveryService):
+def core_device_get_display_info(service_provider: RemoteServiceDiscoveryService) -> None:
     """ Get display information """
-    with DeviceInfoService(service_provider) as app_service:
-        print_json(app_service.get_display_info())
+    asyncio.run(core_device_get_display_info_task(service_provider))
+
+
+async def core_device_query_mobilegestalt_task(service_provider: RemoteServiceDiscoveryService, key: List[str]) -> None:
+    """ Query MobileGestalt """
+    async with DeviceInfoService(service_provider) as app_service:
+        print_json(await app_service.query_mobilegestalt(key))
 
 
 @core_device.command('query-mobilegestalt', cls=RSDCommand)
 @click.argument('key', nargs=-1, type=click.STRING)
-def core_device_query_mobilegestalt(service_provider: RemoteServiceDiscoveryService, key: List[str]):
+def core_device_query_mobilegestalt(service_provider: RemoteServiceDiscoveryService, key: Tuple[str]) -> None:
     """ Query MobileGestalt """
-    with DeviceInfoService(service_provider) as app_service:
-        print_json(app_service.query_mobilegestalt(list(key)))
+    asyncio.run(core_device_query_mobilegestalt_task(service_provider, list(key)))
+
+
+async def core_device_get_lockstate_task(service_provider: RemoteServiceDiscoveryService) -> None:
+    async with DeviceInfoService(service_provider) as app_service:
+        print_json(await app_service.get_lockstate())
 
 
 @core_device.command('get-lockstate', cls=RSDCommand)
-def core_device_get_lockstate(service_provider: RemoteServiceDiscoveryService):
+def core_device_get_lockstate(service_provider: RemoteServiceDiscoveryService) -> None:
     """ Get lockstate """
-    with DeviceInfoService(service_provider) as app_service:
-        print_json(app_service.get_lockstate())
+    asyncio.run(core_device_get_lockstate_task(service_provider))
+
+
+async def core_device_list_apps_task(service_provider: RemoteServiceDiscoveryService) -> None:
+    async with AppServiceService(service_provider) as app_service:
+        print_json(await app_service.list_apps())
 
 
 @core_device.command('list-apps', cls=RSDCommand)
-def core_device_list_apps(service_provider: RemoteServiceDiscoveryService):
+def core_device_list_apps(service_provider: RemoteServiceDiscoveryService) -> None:
     """ Get application list """
-    with AppServiceService(service_provider) as app_service:
-        print_json(app_service.list_apps())
+    asyncio.run(core_device_list_apps_task(service_provider))
