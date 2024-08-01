@@ -377,6 +377,8 @@ def sysmon_process_monitor(service_provider: LockdownClient, name):
                     memory_size = process['memResidentSize']
                     memory_size_KB = memory_size/1024
                     process['memResidentSize'] = memory_size_KB
+                    memory_size_MB = memory_size_KB/1024
+                    process['memResidentSize'] = memory_size_MB
                     #if (process['cpuUsage'] is not None) and (process['cpuUsage'] >= threshold):
                     #if (process_name == name):
                     if (process_name == name):
