@@ -386,7 +386,7 @@ def sysmon_process_monitor(service_provider: LockdownClient, name):
                             cpu_Usage =  float (process['cpuUsage'])/ float (cpu_count)
                             process['cpuUsage'] = cpu_Usage
                             #logger.info(cpu_Usage)
-                        else 
+                        else:
                             process['cpuUsage'] = "None"
                         ts = time.time()
                         entries.append(Process(ts = int(ts), pid=process['pid'], name=process['name'], cpuUsage=process['cpuUsage'], ResidentSize=process['memResidentSize']))
